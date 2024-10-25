@@ -1,11 +1,3 @@
-use std::{
-    fmt::Debug,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
-};
-
-use cadence_macros::{statsd_count, statsd_time};
 use jsonrpsee::{
     core::{async_trait, RpcResult},
     proc_macros::rpc,
@@ -15,7 +7,7 @@ use serde::Deserialize;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::error;
+use std::{fmt::Debug, str::FromStr, sync::Arc, time::Instant};
 
 use crate::{
     errors::invalid_request,
@@ -77,13 +69,11 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
         request_metadata: Option<RequestMetadata>,
     ) -> RpcResult<String> {
         let sent_at = Instant::now();
-        let api_key = request_metadata
-            .clone()
-            .map(|m| m.api_key)
-            .unwrap_or("none".to_string());
-        statsd_count!("send_transaction", 1, "api_key" => &api_key);
+        // let api_key = request_metadata
+        //     .clone()
+        //     .map(|m| m.api_key)
+        //     .unwrap_or("none".to_string());
         validate_send_transaction_params(&params)?;
-        let start = Instant::now();
         let encoding = params.encoding.unwrap_or(UiTransactionEncoding::Base58);
         let binary_encoding = encoding.into_binary_encoding().ok_or_else(|| {
             invalid_request(&format!(
@@ -101,7 +91,6 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
             };
         let signature = versioned_transaction.signatures[0].to_string();
         if self.transaction_store.has_signature(&signature) {
-            statsd_count!("duplicate_transaction", 1, "api_key" => &api_key);
             return Ok(signature);
         }
         let transaction = TransactionData {
@@ -116,11 +105,6 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
             request_metadata,
         };
         self.txn_sender.send_transaction(transaction);
-        statsd_time!(
-            "send_transaction_time",
-            start.elapsed(),
-            "api_key" => &api_key
-        );
         Ok(signature)
     }
 }
@@ -142,12 +126,4 @@ fn param<T: FromStr>(param_str: &str, thing: &str) -> Result<T, ErrorObjectOwned
             None::<String>,
         )
     })
-}
-
-fn log_error<T: Debug>(metric: &str) -> impl Fn(T) -> T {
-    let metric = metric.to_string();
-    return move |e: T| -> T {
-        error!(metric = metric, "{:?}", e);
-        e
-    };
 }
