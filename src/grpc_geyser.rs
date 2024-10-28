@@ -29,7 +29,7 @@ impl GrpcGeyserImpl {
         // polling with processed commitment to get latest leaders
         grpc_geyser.poll_slots();
         // polling with confirmed commitment to get confirmed transactions
-        grpc_geyser.poll_blocks();
+        // grpc_geyser.poll_blocks();
         grpc_geyser.clean_signature_cache();
         grpc_geyser
     }
@@ -140,16 +140,17 @@ impl GrpcGeyserImpl {
 #[async_trait]
 impl SolanaRpc for GrpcGeyserImpl {
     async fn confirm_transaction(&self, signature: String) -> Option<UnixTimestamp> {
-        let start = Instant::now();
+        // let start = Instant::now();
         // in practice if a tx doesn't land in less than 60 seconds it's probably not going to land
-        while start.elapsed() < Duration::from_secs(60) {
-            if let Some(block_time) = self.signature_cache.get(&signature) {
-                return Some(block_time.0.clone());
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
+        // while start.elapsed() < Duration::from_secs(60) {
+        //     if let Some(block_time) = self.signature_cache.get(&signature) {
+        //         return Some(block_time.0.clone());
+        //     }
+        //     sleep(Duration::from_millis(10)).await;
+        // }
         return None;
     }
+
     fn get_next_slot(&self) -> Option<u64> {
         let cur_slot = self.cur_slot.load(Ordering::Relaxed);
         if cur_slot == 0 {
