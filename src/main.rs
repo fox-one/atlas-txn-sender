@@ -10,11 +10,11 @@ mod vendor;
 
 use std::{
     env,
-    net::{IpAddr, Ipv4Addr, UdpSocket},
+    net::{IpAddr, Ipv4Addr},
     sync::Arc,
 };
 
-use cadence::{BufferedUdpMetricSink, QueuingMetricSink, StatsdClient};
+use cadence::{NopMetricSink, StatsdClient};
 use cadence_macros::set_global_default;
 use figment::{providers::Env, Figment};
 use grpc_geyser::GrpcGeyserImpl;
@@ -24,20 +24,16 @@ use rpc_server::{AtlasTxnSenderImpl, AtlasTxnSenderServer};
 use serde::Deserialize;
 use solana_client::{connection_cache::ConnectionCache, rpc_client::RpcClient};
 use solana_sdk::signature::{read_keypair_file, Keypair};
-use tokio::sync::RwLock;
-use tracing::{error, info};
 use transaction_store::TransactionStoreImpl;
 use txn_sender::TxnSenderImpl;
-use yellowstone_grpc_client::GeyserGrpcClient;
 
 #[derive(Debug, Deserialize)]
 struct AtlasTxnSenderEnv {
     identity_keypair_file: Option<String>,
-    grpc_url: Option<String>,
+    ws_url: Option<String>,
     rpc_url: Option<String>,
     port: Option<u16>,
     tpu_connection_pool_size: Option<usize>,
-    x_token: Option<String>,
     num_leaders: Option<usize>,
     leader_offset: Option<i64>,
     txn_sender_threads: Option<usize>,
@@ -106,10 +102,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let transaction_store = Arc::new(TransactionStoreImpl::new());
-    let solana_rpc = Arc::new(GrpcGeyserImpl::new(
-        env.grpc_url.clone().unwrap(),
-        env.x_token.clone(),
-    ));
+    let solana_rpc = Arc::new(GrpcGeyserImpl::new(env.ws_url.clone().unwrap()));
     let rpc_client = Arc::new(RpcClient::new(env.rpc_url.unwrap()));
     let num_leaders = env.num_leaders.unwrap_or(2);
     let leader_offset = env.leader_offset.unwrap_or(0);
@@ -138,24 +131,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn new_metrics_client() {
-    let uri = env::var("METRICS_URI")
-        .or::<String>(Ok("127.0.0.1".to_string()))
-        .unwrap();
-    let port = env::var("METRICS_PORT")
-        .or::<String>(Ok("7998".to_string()))
-        .unwrap()
-        .parse::<u16>()
-        .unwrap();
-    info!("collecting metrics on: {}:{}", uri, port);
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    socket.set_nonblocking(true).unwrap();
-
-    let host = (uri, port);
-    let udp_sink = BufferedUdpMetricSink::from(host, socket).unwrap();
-    let queuing_sink = QueuingMetricSink::from(udp_sink);
-    let builder = StatsdClient::builder("atlas_txn_sender", queuing_sink);
-    let client = builder
-        .with_error_handler(|e| error!("statsd metrics error: {}", e))
-        .build();
+    let client = StatsdClient::from_sink("atlas_txn_sender", NopMetricSink);
     set_global_default(client);
 }

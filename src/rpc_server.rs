@@ -1,9 +1,4 @@
-use std::{
-    fmt::Debug,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
-};
+use std::{fmt::Debug, str::FromStr, sync::Arc, time::Instant};
 
 use cadence_macros::{statsd_count, statsd_time};
 use jsonrpsee::{
@@ -82,7 +77,7 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
             .map(|m| m.api_key)
             .unwrap_or("none".to_string());
         statsd_count!("send_transaction", 1, "api_key" => &api_key);
-        validate_send_transaction_params(&params)?;
+        // validate_send_transaction_params(&params)?;
         let start = Instant::now();
         let encoding = params.encoding.unwrap_or(UiTransactionEncoding::Base58);
         let binary_encoding = encoding.into_binary_encoding().ok_or_else(|| {

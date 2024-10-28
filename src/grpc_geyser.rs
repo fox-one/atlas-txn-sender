@@ -1,39 +1,28 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
-use cadence_macros::statsd_count;
+use crate::solana_rpc::SolanaRpc;
 use dashmap::DashMap;
-use futures::sink::SinkExt;
 use futures::StreamExt;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_rpc_client_api::config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter};
 use solana_sdk::clock::UnixTimestamp;
-use solana_sdk::signature::Signature;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use std::{sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tonic::async_trait;
 use tracing::error;
-use yellowstone_grpc_client::GeyserGrpcClient;
-use yellowstone_grpc_proto::geyser::SubscribeRequestFilterBlocks;
-use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
-    SubscribeRequestPing,
-};
-
-use crate::solana_rpc::SolanaRpc;
 
 pub struct GrpcGeyserImpl {
     endpoint: String,
-    auth_header: Option<String>,
     cur_slot: Arc<AtomicU64>,
     signature_cache: Arc<DashMap<String, (UnixTimestamp, Instant)>>,
 }
 
 impl GrpcGeyserImpl {
-    pub fn new(endpoint: String, auth_header: Option<String>) -> Self {
+    pub fn new(endpoint: String) -> Self {
         let grpc_geyser = Self {
             endpoint,
-            auth_header,
             cur_slot: Arc::new(AtomicU64::new(0)),
             signature_cache: Arc::new(DashMap::new()),
         };
@@ -58,71 +47,58 @@ impl GrpcGeyserImpl {
 
     fn poll_blocks(&self) {
         let endpoint = self.endpoint.clone();
-        let auth_header = self.auth_header.clone();
         let signature_cache = self.signature_cache.clone();
         tokio::spawn(async move {
             loop {
-                let mut grpc_tx;
-                let mut grpc_rx;
-                {
-                    let mut grpc_client = GeyserGrpcClient::connect::<String, String>(
-                        endpoint.clone(),
-                        auth_header.clone(),
-                        None,
-                    );
-                    if let Err(e) = grpc_client {
-                        error!("Error connecting to gRPC, waiting one second then retrying connect: {}", e);
-                        statsd_count!("grpc_connect_error", 1);
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    let subscription = grpc_client
-                        .unwrap()
-                        .subscribe_with_request(Some(get_block_subscribe_request()))
-                        .await;
-                    if let Err(e) = subscription {
-                        error!("Error subscribing to gRPC stream, waiting one second then retrying connect: {}", e);
-                        statsd_count!("grpc_subscribe_error", 1);
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    (grpc_tx, grpc_rx) = subscription.unwrap();
+                let client = PubsubClient::new(&endpoint).await;
+                if let Err(e) = client {
+                    error!("Error creating pubsub client: {}", e);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-                while let Some(message) = grpc_rx.next().await {
-                    match message {
-                        Ok(message) => match message.update_oneof {
-                            Some(UpdateOneof::Block(block)) => {
-                                let block_time = block.block_time.unwrap().timestamp;
-                                for transaction in block.transactions {
-                                    let signature =
-                                        Signature::new(&transaction.signature).to_string();
-                                    signature_cache.insert(signature, (block_time, Instant::now()));
+
+                let client = client.unwrap();
+                let sub = client
+                    .block_subscribe(
+                        RpcBlockSubscribeFilter::All,
+                        Some(RpcBlockSubscribeConfig {
+                            max_supported_transaction_version: Some(0),
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                if let Err(e) = sub {
+                    error!("Error subscribing to block: {}", e);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                let (mut accounts, unsubscriber) = sub.unwrap();
+
+                while let Some(resp) = accounts.next().await {
+                    let update = resp.value;
+
+                    if let Some(e) = update.err {
+                        error!("error in block subscribe: {:?}", e);
+                        break;
+                    }
+
+                    if let Some(block) = update.block {
+                        let block_time = block.block_time.unwrap();
+                        for tx in block.transactions.unwrap_or_default() {
+                            if let Some(tx) = tx.transaction.decode() {
+                                for signature in tx.signatures {
+                                    signature_cache.insert(
+                                        signature.to_string(),
+                                        (block_time, Instant::now()),
+                                    );
                                 }
                             }
-                            Some(UpdateOneof::Ping(_)) => {
-                                // This is necessary to keep load balancers that expect client pings alive. If your load balancer doesn't
-                                // require periodic client pings then this is unnecessary
-                                let ping = grpc_tx.send(ping()).await;
-                                if let Err(e) = ping {
-                                    error!("Error sending ping: {}", e);
-                                    statsd_count!("grpc_ping_error", 1);
-                                    break;
-                                }
-                            }
-                            Some(UpdateOneof::Pong(_)) => {}
-                            _ => {
-                                error!("Unknown message: {:?}", message);
-                            }
-                        },
-                        Err(error) => {
-                            error!(
-                                "error in block subscribe, resubscribing in 1 second: {error:?}"
-                            );
-                            statsd_count!("grpc_resubscribe", 1);
-                            break;
                         }
                     }
                 }
+
+                unsubscriber().await;
                 sleep(Duration::from_secs(1)).await;
             }
         });
@@ -130,65 +106,31 @@ impl GrpcGeyserImpl {
 
     fn poll_slots(&self) {
         let endpoint = self.endpoint.clone();
-        let auth_header = self.auth_header.clone();
         let cur_slot = self.cur_slot.clone();
-        // let grpc_tx = self.grpc_tx.clone();
         tokio::spawn(async move {
             loop {
-                let mut grpc_tx;
-                let mut grpc_rx;
-                {
-                    let mut grpc_client = GeyserGrpcClient::connect::<String, String>(
-                        endpoint.clone(),
-                        auth_header.clone(),
-                        None,
-                    );
-                    if let Err(e) = grpc_client {
-                        error!("Error connecting to gRPC, waiting one second then retrying connect: {}", e);
-                        statsd_count!("grpc_connect_error", 1);
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    let subscription = grpc_client.unwrap().subscribe().await;
-                    if let Err(e) = subscription {
-                        error!("Error subscribing to gRPC stream, waiting one second then retrying connect: {}", e);
-                        statsd_count!("grpc_subscribe_error", 1);
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    (grpc_tx, grpc_rx) = subscription.unwrap();
+                let client = PubsubClient::new(&endpoint).await;
+                if let Err(e) = client {
+                    error!("Error creating pubsub client: {}", e);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-                grpc_tx.send(get_slot_subscribe_request()).await.unwrap();
-                while let Some(message) = grpc_rx.next().await {
-                    match message {
-                        Ok(msg) => {
-                            match msg.update_oneof {
-                                Some(UpdateOneof::Slot(slot)) => {
-                                    cur_slot.store(slot.slot, Ordering::Relaxed);
-                                }
-                                Some(UpdateOneof::Ping(_)) => {
-                                    // This is necessary to keep load balancers that expect client pings alive. If your load balancer doesn't
-                                    // require periodic client pings then this is unnecessary
-                                    let ping = grpc_tx.send(ping()).await;
-                                    if let Err(e) = ping {
-                                        error!("Error sending ping: {}", e);
-                                        statsd_count!("grpc_ping_error", 1);
-                                        break;
-                                    }
-                                }
-                                Some(UpdateOneof::Pong(_)) => {}
-                                _ => {
-                                    error!("Unknown message: {:?}", msg);
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            error!("error in slot subscribe, resubscribing in 1 second: {error:?}");
-                            statsd_count!("grpc_resubscribe", 1);
-                            break;
-                        }
-                    }
+
+                let client = client.unwrap();
+                let sub = client.slot_subscribe().await;
+                if let Err(e) = sub {
+                    error!("Error subscribing to slot: {}", e);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
+
+                let (mut accounts, unsubscriber) = sub.unwrap();
+
+                while let Some(slot) = accounts.next().await {
+                    cur_slot.store(slot.slot, Ordering::Relaxed);
+                }
+
+                unsubscriber().await;
                 sleep(Duration::from_secs(1)).await;
             }
         });
@@ -223,39 +165,4 @@ fn generate_random_string(len: usize) -> String {
         .take(len)
         .map(char::from)
         .collect()
-}
-
-fn get_block_subscribe_request() -> SubscribeRequest {
-    SubscribeRequest {
-        blocks: HashMap::from_iter(vec![(
-            generate_random_string(20),
-            SubscribeRequestFilterBlocks {
-                account_include: vec![],
-                include_transactions: Some(true),
-                include_accounts: Some(false),
-                include_entries: Some(false),
-            },
-        )]),
-        commitment: Some(CommitmentLevel::Confirmed.into()),
-        ..Default::default()
-    }
-}
-
-fn get_slot_subscribe_request() -> SubscribeRequest {
-    SubscribeRequest {
-        slots: HashMap::from_iter(vec![(
-            generate_random_string(20).to_string(),
-            SubscribeRequestFilterSlots {
-                filter_by_commitment: Some(true),
-            },
-        )]),
-        ..Default::default()
-    }
-}
-
-fn ping() -> SubscribeRequest {
-    SubscribeRequest {
-        ping: Some(SubscribeRequestPing { id: 1 }),
-        ..Default::default()
-    }
 }

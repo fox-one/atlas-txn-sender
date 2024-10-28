@@ -3,17 +3,17 @@ use solana_client::{
     connection_cache::ConnectionCache, nonblocking::tpu_connection::TpuConnection,
 };
 use solana_program_runtime::compute_budget::{ComputeBudget, MAX_COMPUTE_UNIT_LIMIT};
-use solana_sdk::transaction::{self, VersionedTransaction};
+use solana_sdk::transaction::VersionedTransaction;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     runtime::{Builder, Runtime},
-    time::{error::Elapsed, sleep, timeout},
+    time::{sleep, timeout},
 };
 use tonic::async_trait;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::{
     leader_tracker::LeaderTracker,

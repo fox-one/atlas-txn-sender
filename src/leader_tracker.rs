@@ -1,4 +1,3 @@
-use core::panic;
 use std::{
     collections::HashMap,
     sync::{
@@ -59,7 +58,7 @@ impl LeaderTrackerImpl {
     /// poll_slot polls for every new slot returned by gRPC geyser
     fn poll_slot(&self) {
         let solana_rpc = self.solana_rpc.clone();
-        let cur_slot = self.cur_slot.clone();
+        let cur_slot: Arc<AtomicU64> = self.cur_slot.clone();
         let leader_offset = self.leader_offset;
         tokio::spawn(async move {
             loop {
@@ -94,6 +93,10 @@ impl LeaderTrackerImpl {
     fn poll_slot_leaders_once(&self) -> Result<(), AtlasTxnSenderError> {
         let next_slot = self.cur_slot.load(Ordering::Relaxed);
         debug!("Polling slot leaders for slot {}", next_slot);
+        if next_slot == 0 {
+            return Err(AtlasTxnSenderError::Custom("Slot is 0".to_string()));
+        }
+
         // polling 1000 slots ahead is more than enough
         let slot_leaders = self.rpc_client.get_slot_leaders(next_slot, 1000);
         if let Err(e) = slot_leaders {
